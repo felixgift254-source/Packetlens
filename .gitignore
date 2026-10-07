@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.db
+*.sqlite3
+*.log
+.DS_Store
+.vscode/
+.ml_model.joblib
+dashboard_live.png
+dashboard_screenshot.png
+scratch_*.py

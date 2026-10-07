@@ -1,0 +1,136 @@
+import argparse
+from scapy.all import sniff, IP, IPv6, TCP, UDP, ICMP, ARP
+from scapy.layers.tls.all import TLSClientHello, TLS_Ext_ServerName, TLSCertificate
+from scapy.layers.http import HTTPRequest
+from scapy.layers.dns import DNSQR
+import database
+from datetime import datetime
+
+def packet_callback(packet):
+    try:
+        src_ip = None
+        dst_ip = None
+        protocol = "Other"
+        src_port = 0
+        dst_port = 0
+        sni = None
+        info = None
+        tcp_flags = None
+        length = len(packet)
+
+        # Handle IPv4 / IPv6
+        if IP in packet:
+            src_ip = packet[IP].src
+            dst_ip = packet[IP].dst
+        elif IPv6 in packet:
+            src_ip = packet[IPv6].src
+            dst_ip = packet[IPv6].dst
+        # Handle ARP
+        elif ARP in packet:
+            src_ip = packet[ARP].psrc
+            dst_ip = packet[ARP].pdst
+            protocol = "ARP"
+            op = "Request" if packet[ARP].op == 1 else "Reply"
+            info = f"ARP {op} (MAC: {packet[ARP].hwsrc})"
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+            database.insert_packet(timestamp, src_ip, dst_ip, src_port, dst_port, protocol, length, sni, info, tcp_flags)
+            return
+
+        if src_ip and dst_ip:
+            if TCP in packet:
+                protocol = "TCP"
+                src_port = packet[TCP].sport
+                dst_port = packet[TCP].dport
+                tcp_flags = str(packet[TCP].flags)
+                
+                # HTTP Parsing
+                if packet.haslayer(HTTPRequest):
+                    try:
+                        host = packet[HTTPRequest].Host.decode('utf-8', errors='ignore') if packet[HTTPRequest].Host else ''
+                        path = packet[HTTPRequest].Path.decode('utf-8', errors='ignore') if packet[HTTPRequest].Path else ''
+                        method = packet[HTTPRequest].Method.decode('utf-8', errors='ignore') if packet[HTTPRequest].Method else ''
+                        info = f"HTTP {method} {host}{path}"
+                    except Exception:
+                        pass
+                
+                # HTTPS SNI & Cert Parsing
+                if packet.haslayer(TLSClientHello):
+                    hello = packet[TLSClientHello]
+                    if hello.haslayer(TLS_Ext_ServerName):
+                        servernames = hello[TLS_Ext_ServerName].servernames
+                        if servernames:
+                            sni = servernames[0].servername.decode('utf-8', errors='ignore')
+                            info = f"HTTPS SNI: {sni}"
+                elif packet.haslayer(TLSCertificate):
+                    try:
+                        cert_msg = packet[TLSCertificate]
+                        if cert_msg.certs and len(cert_msg.certs) > 0:
+                            cert = cert_msg.certs[0][1] # Get X509_Cert object
+                            info = f"TLS Cert: {cert.subject}"
+                    except Exception:
+                        pass
+                            
+            elif UDP in packet:
+                protocol = "UDP"
+                src_port = packet[UDP].sport
+                dst_port = packet[UDP].dport
+                
+                # DNS Parsing
+                if packet.haslayer(DNSQR):
+                    try:
+                        qname = packet[DNSQR].qname.decode('utf-8', errors='ignore')
+                        info = f"DNS Query: {qname}"
+                    except Exception:
+                        pass
+                        
+            elif ICMP in packet:
+                protocol = "ICMP"
+                icmp_types = {0: "Echo Reply", 3: "Dest Unreachable", 8: "Echo Request", 11: "Time Exceeded"}
+                itype = packet[ICMP].type
+                info = icmp_types.get(itype, f"Type {itype}")
+                
+            # Current timestamp
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+            
+            # Insert into SQLite Database
+            database.insert_packet(timestamp, src_ip, dst_ip, src_port, dst_port, protocol, length, sni, info, tcp_flags)
+            
+    except Exception as e:
+        # Gracefully ignore any packets that cause an error
+        pass
+
+def main():
+    parser = argparse.ArgumentParser(description="Real-Time Network Traffic Sniffer")
+    parser.add_argument("-i", "--interface", help="Network interface to sniff on (e.g., eth0, wlan0)", default="")
+    parser.add_argument("-f", "--filter", help="BPF capture filter (e.g., 'tcp port 80')", default="")
+    parser.add_argument("-r", "--read", help="Read from offline PCAP file", default="")
+    args = parser.parse_args()
+
+    # Initialize the database table before capturing
+    database.init_db()
+    
+    if args.read:
+        print(f"[*] Parsing offline PCAP: {args.read}")
+    else:
+        if not args.interface:
+            print("[!] Error: Interface (-i) must be provided for live sniffing.")
+            return
+        print(f"[*] Starting live sniffer on interface '{args.interface}'...")
+        print("[*] Press Ctrl+C to stop.")
+
+    try:
+        # Start sniffing
+        if args.read:
+            sniff(offline=args.read, filter=args.filter, prn=packet_callback, store=False)
+            print("[*] Offline processing complete.")
+        else:
+            sniff(iface=args.interface, filter=args.filter, prn=packet_callback, store=False)
+    except KeyboardInterrupt:
+        print("\n[*] Stopping sniffer.")
+    except PermissionError:
+        print("[!] Error: You need to run this script with sudo or administrator privileges (Scapy requirement).")
+    except Exception as e:
+        print(f"[!] Sniffing error: {e}")
+
+if __name__ == "__main__":
+    main()

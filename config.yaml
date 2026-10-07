@@ -1,0 +1,77 @@
+# PacketLens Configuration
+# Edit this file to tune thresholds and threat intelligence without touching code.
+
+thresholds:
+  # Maximum rows to keep in the SQLite database (circular logging)
+  # ⚠️  Low-RAM tip: keep this at 3000–5000 on a 4 GB machine.
+  #     Each row is ~500 bytes; 5000 rows ≈ 2.5 MB in memory per refresh.
+  circular_log_limit: 5000
+
+  # Bandwidth spike alert: bytes/sec above this triggers a dashboard warning
+  bandwidth_spike_bytes_per_sec: 5000000  # 5 MB/s
+
+  # Port scan detector: unique dst_ports within the time window below
+  port_scan_unique_ports: 15
+  port_scan_window_seconds: 30
+
+threat_intel:
+  # Ports that trigger a "Suspicious Port Activity" alert
+  suspicious_ports:
+    4444: "Metasploit"
+    1337: "Leet"
+    31337: "BackOrifice"
+    6667: "IRC/Botnet"
+    9001: "Tor"
+    6697: "IRC-SSL"
+
+  # IPs that trigger a "Malicious IP Detected" alert
+  # Replace/extend with real feeds (e.g. Feodo Tracker, Emerging Threats)
+  blocklist_ips:
+    - "185.159.82.15"
+    - "45.144.225.10"
+    - "193.163.125.138"
+
+geo:
+  # ip-api.com free tier: 45 requests/minute
+  # ⚠️  Low-RAM tip: geo lookups are cached in session_state. They are fast
+  #     but consume memory proportional to unique destination IPs seen.
+  api_timeout_seconds: 2
+
+ml:
+  # IsolationForest: fraction of data treated as anomalies
+  contamination: 0.05
+  # Only retrain the model if the number of unique src_ips changes by more than this
+  # ⚠️  Low-RAM tip: raise this to 5–10 to retrain less often (retraining is CPU-heavy)
+  retrain_threshold: 5
+
+snmp:
+  # Set enabled: true to activate polling, or toggle it from the UI sidebar
+  enabled: false
+  poll_interval_seconds: 30
+  port: 161
+
+  # SNMPv2c settings (default)
+  version: "2c"
+  community: "public"
+
+  # SNMPv3 settings — only used when version is "3"
+  # auth_protocol: SHA   # SHA / MD5
+  # priv_protocol: AES   # AES / DES
+  # auth_key: ""
+  # priv_key: ""
+
+  # Target device IPs to poll (extend this list or add from the UI)
+  targets: []
+
+  thresholds:
+    link_down_alert: true          # alert when any interface goes down
+    cpu_alert_pct: 80              # alert when device CPU exceeds this %
+    error_rate_alert: 100          # alert when interface errors/sec exceed this
+
+  # ⚠️  Low-RAM tip: keep this low so SNMP history doesn't eat memory
+  snmp_cleanup_limit: 2000
+
+database:
+  # Packet batch-write size — flush to SQLite every N packets (tune for throughput)
+  # ⚠️  Low-RAM tip: larger batch = fewer DB writes = less CPU churn
+  batch_size: 100

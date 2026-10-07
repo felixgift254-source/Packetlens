@@ -1,0 +1,148 @@
+import sqlite3
+import os
+import io
+import pandas as pd
+
+DB_NAME = "network_traffic.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS packets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME,
+            src_ip TEXT,
+            dst_ip TEXT,
+            src_port INTEGER,
+            dst_port INTEGER,
+            protocol TEXT,
+            length INTEGER,
+            sni TEXT,
+            info TEXT,
+            tcp_flags TEXT
+        )
+    ''')
+    # Create an index to speed up recent data retrieval
+    c.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON packets(timestamp)')
+    
+    # Check if new columns exist to support existing databases
+    c.execute("PRAGMA table_info(packets)")
+    columns = [col[1] for col in c.fetchall()]
+    if 'sni' not in columns:
+        c.execute("ALTER TABLE packets ADD COLUMN sni TEXT")
+    if 'src_port' not in columns:
+        c.execute("ALTER TABLE packets ADD COLUMN src_port INTEGER")
+    if 'dst_port' not in columns:
+        c.execute("ALTER TABLE packets ADD COLUMN dst_port INTEGER")
+    if 'info' not in columns:
+        c.execute("ALTER TABLE packets ADD COLUMN info TEXT")
+    if 'tcp_flags' not in columns:
+        c.execute("ALTER TABLE packets ADD COLUMN tcp_flags TEXT")
+        
+    conn.commit()
+    conn.close()
+
+def insert_packet(timestamp, src_ip, dst_ip, src_port, dst_port, protocol, length, sni=None, info=None, tcp_flags=None):
+    try:
+        # Use timeout to handle concurrent database locks gracefully
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO packets (timestamp, src_ip, dst_ip, src_port, dst_port, protocol, length, sni, info, tcp_flags)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (timestamp, src_ip, dst_ip, src_port, dst_port, protocol, length, sni, info, tcp_flags))
+        conn.commit()
+    except Exception as e:
+        print(f"Database error: {e}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+def get_data(limit=10000):
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        # Read the latest `limit` packets to prevent memory issues over time
+        query = f"SELECT * FROM packets ORDER BY timestamp DESC LIMIT {limit}"
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        if not df.empty:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+        return df
+    except Exception as e:
+        print(f"Error reading from database: {e}")
+        return pd.DataFrame()
+
+def clear_db():
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        c = conn.cursor()
+        c.execute("DELETE FROM packets")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Database error: {e}")
+
+def cleanup_old_records(limit=10000):
+    """Implement circular logging by keeping only the latest 'limit' records."""
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        c = conn.cursor()
+        c.execute(f'''
+            DELETE FROM packets 
+            WHERE id NOT IN (
+                SELECT id FROM packets 
+                ORDER BY timestamp DESC 
+                LIMIT {limit}
+            )
+        ''')
+        conn.commit()
+    except Exception as e:
+        print(f"Cleanup error: {e}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+def get_packets_as_pcap(limit=10000):
+    """
+    Build a real .pcap file from stored packet metadata.
+    Returns raw bytes that can be served directly via st.download_button.
+    Note: Payloads are blank (we only stored headers), but the pcap is
+    valid and fully openable in Wireshark.
+    """
+    try:
+        from scapy.all import IP, TCP, UDP, ICMP, wrpcap
+        df = get_data(limit=limit)
+        if df.empty:
+            return None
+        
+        protocol_map = {"TCP": 6, "UDP": 17, "ICMP": 1}
+        packets = []
+        
+        for _, row in df.iterrows():
+            try:
+                proto_num = protocol_map.get(row['protocol'], 0)
+                ip_layer = IP(src=str(row['src_ip']), dst=str(row['dst_ip']), proto=proto_num, len=int(row['length']))
+                
+                if row['protocol'] == 'TCP':
+                    pkt = ip_layer / TCP(sport=int(row.get('src_port', 0) or 0), dport=int(row.get('dst_port', 0) or 0))
+                elif row['protocol'] == 'UDP':
+                    pkt = ip_layer / UDP(sport=int(row.get('src_port', 0) or 0), dport=int(row.get('dst_port', 0) or 0))
+                elif row['protocol'] == 'ICMP':
+                    pkt = ip_layer / ICMP()
+                else:
+                    pkt = ip_layer
+                
+                packets.append(pkt)
+            except Exception:
+                continue
+        
+        if not packets:
+            return None
+        
+        buf = io.BytesIO()
+        wrpcap(buf, packets)
+        return buf.getvalue()
+    except Exception as e:
+        print(f"PCAP export error: {e}")
+        return None

@@ -1,0 +1,597 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import time
+import database
+import requests
+import ipaddress
+import subprocess
+import sys
+import os
+import networkx as nx
+from datetime import datetime
+from sklearn.ensemble import IsolationForest
+
+# ── Page config ─────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="LYFT PacketLens — Network Traffic Analyzer",
+    page_icon="🔬",
+    layout="wide",
+)
+
+# ── Port → Service label lookup ──────────────────────────────────────────────
+PORT_SERVICES = {
+    20: "FTP-Data", 21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP",
+    53: "DNS", 67: "DHCP", 68: "DHCP", 80: "HTTP", 110: "POP3",
+    143: "IMAP", 443: "HTTPS", 465: "SMTPS", 587: "SMTP", 993: "IMAPS",
+    995: "POP3S", 1194: "OpenVPN", 1433: "MSSQL", 3306: "MySQL",
+    3389: "RDP", 5432: "PostgreSQL", 5900: "VNC", 6379: "Redis",
+    8080: "HTTP-Alt", 8443: "HTTPS-Alt", 27017: "MongoDB",
+}
+
+# ── Helper: detect available interfaces ─────────────────────────────────────
+@st.cache_data(ttl=30)
+def get_interfaces():
+    try:
+        raw = subprocess.check_output(["ip", "-o", "link", "show"], stderr=subprocess.DEVNULL).decode()
+        ifaces = []
+        for line in raw.strip().splitlines():
+            parts = line.split(": ")
+            if len(parts) >= 2:
+                name = parts[1].split("@")[0].strip()
+                if name != "lo":
+                    ifaces.append(name)
+        return ifaces if ifaces else ["eth0"]
+    except Exception:
+        return ["eth0", "wlan0"]
+
+# ── Helper: geo-location (cached per IP, no rate-limit risk) ─────────────────
+@st.cache_data(max_entries=1000)
+def get_ip_location(ip: str):
+    try:
+        if ipaddress.ip_address(ip).is_private:
+            return None
+        r = requests.get(f"http://ip-api.com/json/{ip}", timeout=2)
+        d = r.json()
+        if d.get("status") == "success":
+            return d["lat"], d["lon"], d.get("country", "?"), d.get("city", "?")
+    except Exception:
+        pass
+    return None
+
+# ── Helper: apply display filters to DataFrame ───────────────────────────────
+def apply_filters(df: pd.DataFrame, filter_text: str, proto_filter: str, port_filter: str) -> pd.DataFrame:
+    out = df.copy()
+    if filter_text:
+        mask = (
+            out["src_ip"].str.contains(filter_text, case=False, na=False) |
+            out["dst_ip"].str.contains(filter_text, case=False, na=False) |
+            out["sni"].astype(str).str.contains(filter_text, case=False, na=False)
+        )
+        out = out[mask]
+    if proto_filter != "All":
+        out = out[out["protocol"] == proto_filter]
+    if port_filter.strip():
+        try:
+            p = int(port_filter.strip())
+            out = out[out["dst_port"].eq(p) | out["src_port"].eq(p)]
+        except ValueError:
+            pass
+    return out
+
+# ── Init DB ──────────────────────────────────────────────────────────────────
+database.init_db()
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SIDEBAR
+# ════════════════════════════════════════════════════════════════════════════
+st.sidebar.image(
+    "https://raw.githubusercontent.com/simple-icons/simple-icons/develop/icons/wireshark.svg",
+    width=36,
+)
+st.sidebar.title("LYFT PacketLens 🔬")
+st.sidebar.caption("Real-Time Network Traffic Analyzer")
+st.sidebar.markdown("---")
+
+# ── Interface auto-detection ─────────────────────────────────────────────────
+st.sidebar.subheader("📡 Capture Interface")
+ifaces = get_interfaces()
+interface = st.sidebar.selectbox(
+    "Select Interface",
+    options=ifaces,
+    index=0,
+    help="Auto-detected from your system. Run `ip link show` to verify.",
+)
+
+# ── Capture controls ──────────────────────────────────────────────────────────
+st.sidebar.markdown("---")
+st.sidebar.subheader("▶ Capture Controls")
+
+bpf_filter = st.sidebar.text_input("BPF Capture Filter", value="", help="e.g. tcp port 80, host 8.8.8.8")
+
+if "sniffer_pid" not in st.session_state:
+    st.session_state.sniffer_pid = None
+
+cap_col1, cap_col2 = st.sidebar.columns(2)
+start_btn = cap_col1.button("▶ Start", use_container_width=True)
+stop_btn  = cap_col2.button("⏹ Stop",  use_container_width=True)
+
+if start_btn:
+    if st.session_state.sniffer_pid is None:
+        cmd = ["sudo", sys.executable, "sniffer.py", "-i", interface]
+        if bpf_filter.strip():
+            cmd.extend(["-f", bpf_filter.strip()])
+        # Start in a new process group so we can kill the whole tree (sniffer + sudo child)
+        proc = subprocess.Popen(cmd, start_new_session=True)
+        st.session_state.sniffer_pid = proc.pid
+        st.session_state.sniffer_pgid = os.getpgid(proc.pid)
+        st.sidebar.success(f"Sniffing on **{interface}** (PID {proc.pid})")
+    else:
+        st.sidebar.warning("Capture already running.")
+
+if stop_btn:
+    if st.session_state.sniffer_pid is not None:
+        # Fix #2: kill the entire process group so the sudo child (Scapy) is not orphaned
+        pgid = st.session_state.get("sniffer_pgid")
+        if pgid:
+            os.system(f"sudo kill -- -{pgid}")
+        else:
+            os.system(f"sudo kill {st.session_state.sniffer_pid}")
+        st.session_state.sniffer_pid = None
+        st.session_state.sniffer_pgid = None
+        st.sidebar.info("Capture stopped.")
+    else:
+        st.sidebar.warning("No capture is running.")
+
+# Status pill
+if st.session_state.sniffer_pid:
+    st.sidebar.success(f"🟢 Live — PID {st.session_state.sniffer_pid}")
+else:
+    st.sidebar.error("🔴 Idle")
+
+# ── Data controls ─────────────────────────────────────────────────────────────
+st.sidebar.markdown("---")
+st.sidebar.subheader("⚙ Data Controls")
+if st.sidebar.button("🗑 Clear Database", use_container_width=True):
+    database.clear_db()
+    st.sidebar.success("Database cleared!")
+
+refresh_rate = st.sidebar.slider("Refresh Rate (seconds)", min_value=1, max_value=10, value=2)
+auto_refresh  = st.sidebar.checkbox("Auto-Refresh", value=True)
+
+# ── PCAP Export ───────────────────────────────────────────────────────────────
+st.sidebar.markdown("---")
+st.sidebar.subheader("📦 Export Session")
+if st.sidebar.button("Build PCAP", use_container_width=True):
+    with st.spinner("Building PCAP…"):
+        pcap_bytes = database.get_packets_as_pcap()
+    if pcap_bytes:
+        st.session_state["pcap_bytes"] = pcap_bytes
+        st.sidebar.success("Ready — click Download ↓")
+    else:
+        st.sidebar.warning("No data to export yet.")
+
+if "pcap_bytes" in st.session_state and st.session_state["pcap_bytes"]:
+    fname = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pcap"
+    st.sidebar.download_button(
+        label="⬇ Download .pcap",
+        data=st.session_state["pcap_bytes"],
+        file_name=fname,
+        mime="application/vnd.tcpdump.pcap",
+        use_container_width=True,
+    )
+
+# ── PCAP Import ───────────────────────────────────────────────────────────────
+st.sidebar.markdown("---")
+st.sidebar.subheader("📂 Import Offline PCAP")
+uploaded_pcap = st.sidebar.file_uploader("Upload .pcap / .pcapng", type=["pcap", "pcapng"])
+if uploaded_pcap is not None:
+    if st.sidebar.button("Process PCAP", use_container_width=True):
+        with st.spinner("Parsing Offline PCAP..."):
+            temp_pcap = "/tmp/uploaded_packetlens.pcap"
+            with open(temp_pcap, "wb") as f:
+                f.write(uploaded_pcap.read())
+            # Fix #5: offline PCAP writes to the same live DB so data merges into the dashboard
+            # We pass no --db flag; sniffer uses the default network_traffic.db intentionally.
+            # Clear first so imported data doesn't silently mix with stale live data.
+            database.clear_db()
+            proc = subprocess.run(["sudo", sys.executable, "sniffer.py", "-r", temp_pcap])
+            st.sidebar.success("PCAP imported — live data cleared and replaced. Dashboard will update.")
+            st.rerun()
+
+# ════════════════════════════════════════════════════════════════════════════
+#  MAIN DASHBOARD
+# ════════════════════════════════════════════════════════════════════════════
+st.title("🔬 LYFT PacketLens — Network Traffic Analyzer")
+st.caption("Live capture · Geo-mapping · ML anomaly detection · SNI extraction · PCAP export")
+
+# ── Fetch & clean data ───────────────────────────────────────────────────────
+database.cleanup_old_records(limit=10000)
+df_raw = database.get_data(limit=10000)
+
+if df_raw.empty:
+    st.info("No packets captured yet. Select an interface and press **▶ Start**.")
+    st.code(f"sudo python3 sniffer.py -i {interface}", language="bash")
+    if auto_refresh:
+        time.sleep(refresh_rate)
+        st.rerun()
+    st.stop()
+
+df_raw = df_raw.sort_values("timestamp", ascending=True)
+
+# Add port columns if not present (older rows won't have them)
+for col in ["src_port", "dst_port"]:
+    if col not in df_raw.columns:
+        df_raw[col] = 0
+df_raw["src_port"] = pd.to_numeric(df_raw.get("src_port", 0), errors="coerce").fillna(0).astype(int)
+df_raw["dst_port"] = pd.to_numeric(df_raw.get("dst_port", 0), errors="coerce").fillna(0).astype(int)
+
+# Add service labels
+df_raw["service"] = df_raw["dst_port"].map(PORT_SERVICES).fillna(
+    df_raw["src_port"].map(PORT_SERVICES)
+).fillna("—")
+
+# ── Display Filter Bar & CSV Export ──────────────────────────────────────────
+st.subheader("🔍 Display Filter")
+f_col1, f_col2, f_col3, f_col4 = st.columns([3, 1, 1, 1])
+with f_col1:
+    filter_text = st.text_input(
+        "Filter by IP or domain",
+        placeholder="e.g.  192.168.1.1  or  google.com",
+        label_visibility="collapsed",
+    )
+with f_col2:
+    all_protos = ["All"] + sorted(df_raw["protocol"].unique().tolist())
+    proto_filter = st.selectbox("Protocol", all_protos, label_visibility="collapsed")
+with f_col3:
+    port_filter = st.text_input("Port", placeholder="e.g. 443", label_visibility="collapsed")
+with f_col4:
+    csv_fname = f"capture_filtered_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    st.download_button(
+        label="⬇ Export to CSV",
+        data=df_raw.to_csv(index=False),
+        file_name=csv_fname,
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+df = apply_filters(df_raw, filter_text, proto_filter, port_filter)
+if len(df) < len(df_raw):
+    st.caption(f"Showing **{len(df):,}** of {len(df_raw):,} packets after filter.")
+
+st.markdown("---")
+
+# ── Geo-Location Map ──────────────────────────────────────────────────────────
+st.subheader("🌍 Destination IP Locations")
+
+# Fix #4: cache the full locations list; only re-query IPs we haven't seen before
+@st.cache_data(show_spinner=False, max_entries=1)
+def build_locations(ip_tuple: tuple) -> list:
+    """Re-runs only when the set of unique destination IPs changes."""
+    results = []
+    for ip in ip_tuple:
+        loc = get_ip_location(ip)
+        if loc:
+            results.append({"ip": ip, "lat": loc[0], "lon": loc[1], "country": loc[2], "city": loc[3]})
+    return results
+
+unique_dst_ips = tuple(sorted(df["dst_ip"].unique()))
+locations = build_locations(unique_dst_ips)
+
+if locations:
+    map_df = pd.DataFrame(locations)
+    fig_map = px.scatter_geo(
+        map_df, lat="lat", lon="lon",
+        hover_name="ip", hover_data={"city": True, "country": True, "lat": False, "lon": False},
+        projection="natural earth",
+        size_max=15,
+    )
+    fig_map.update_traces(marker=dict(size=10, color="#FF4B4B", line=dict(width=1, color="white")))
+    fig_map.update_layout(
+        template="plotly_dark",
+        margin=dict(l=0, r=0, t=30, b=0),
+        geo=dict(bgcolor="#0e1117", showland=True, landcolor="#1a1d23",
+                 showocean=True, oceancolor="#0e1117",
+                 showcountries=True, countrycolor="#444"),
+    )
+    st.plotly_chart(fig_map, use_container_width=True)
+else:
+    st.info("No public destination IPs resolved yet. Geo-location populates as packets flow in.")
+
+st.markdown("---")
+
+# ── KPI Metrics ───────────────────────────────────────────────────────────────
+total_packets = len(df)
+total_bytes   = df["length"].sum()
+total_mb      = total_bytes / (1024 * 1024)
+
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("📦 Total Packets", f"{total_packets:,}")
+k2.metric("📊 Data Captured", f"{total_mb:.4f} MB")
+k3.metric("🖥 Unique Source IPs", df["src_ip"].nunique())
+k4.metric("🌐 Unique Dest IPs",   df["dst_ip"].nunique())
+
+st.markdown("---")
+
+# ── Security Alerts & Threat Intelligence ─────────────────────────────────────
+st.subheader("🚨 Security Intel & Alerts")
+alert_col, track_col = st.columns([1, 1])
+
+with alert_col:
+    # 1. Suspicious Port Alerting
+    suspicious_ports = {4444: "Metasploit", 1337: "Leet", 31337: "BackOrifice", 6667: "IRC/Botnet"}
+    suspicious_traffic = df[df["dst_port"].isin(suspicious_ports) | df["src_port"].isin(suspicious_ports)]
+    for _, row in suspicious_traffic.drop_duplicates(subset=["src_ip", "dst_ip", "dst_port"]).iterrows():
+        port = row["dst_port"] if row["dst_port"] in suspicious_ports else row["src_port"]
+        st.error(f"🔴 **Suspicious Port Activity**: `{row['src_ip']}` ↔ `{row['dst_ip']}` on Port **{port}** ({suspicious_ports[port]})")
+
+    # 2. Port Scan Detector
+    scan_threshold = 15
+    port_scans = df.groupby("src_ip")["dst_port"].nunique().reset_index()
+    scanners = port_scans[port_scans["dst_port"] > scan_threshold]
+    for _, row in scanners.iterrows():
+        st.error(f"🔴 **Possible Port Scan**: `{row['src_ip']}` accessed **{row['dst_port']}** unique ports.")
+        
+    # 3. Known Bad IP Lookup (Mock Threat Feed)
+    mock_bad_ips = ["185.159.82.15", "45.144.225.10", "193.163.125.138"]
+    bad_traffic = df[df["src_ip"].isin(mock_bad_ips) | df["dst_ip"].isin(mock_bad_ips)]
+    for _, row in bad_traffic.drop_duplicates(subset=["src_ip", "dst_ip"]).iterrows():
+        bad_ip = row["src_ip"] if row["src_ip"] in mock_bad_ips else row["dst_ip"]
+        st.error(f"🔴 **Malicious IP Detected**: `{bad_ip}` is on the Threat Intelligence Blocklist.")
+
+    # 4. ML Anomaly Detection (Expanded Features)
+    ml_data = df.groupby("src_ip").agg(
+        packet_count=("id", "count"),
+        avg_payload_size=("length", "mean"),
+        unique_ports=("dst_port", "nunique")
+    ).reset_index()
+
+    # Fix #1: pre-initialise anomalies so the "all-clear" check never raises NameError
+    anomalies = pd.DataFrame()
+    if len(ml_data) >= 5:
+        model = IsolationForest(contamination=0.05, random_state=42)
+        ml_data["anomaly"] = model.fit_predict(ml_data[["packet_count", "avg_payload_size", "unique_ports"]])
+        anomalies = ml_data[ml_data["anomaly"] == -1]
+        for _, row in anomalies.iterrows():
+            st.warning(
+                f"🤖 **ML Anomaly Detected**: `{row['src_ip']}` "
+                f"(Pkts: {row['packet_count']} | Avg Size: {row['avg_payload_size']:.0f} B | Ports: {row['unique_ports']})"
+            )
+
+    if suspicious_traffic.empty and scanners.empty and bad_traffic.empty and anomalies.empty:
+        st.success("✅ No security threats detected.")
+
+with track_col:
+    # 5. Connection Tracking (TCP States)
+    if "tcp_flags" in df.columns:
+        st.markdown("**TCP Connection States**")
+        tcp_df = df[df["protocol"] == "TCP"].dropna(subset=["tcp_flags"])
+        
+        # Determine state based on last seen flags for a connection pair
+        connections = tcp_df.groupby(["src_ip", "dst_ip", "dst_port"]).last().reset_index()
+        connections["State"] = "ESTABLISHED"
+        connections.loc[connections["tcp_flags"].str.contains("F|R", na=False), "State"] = "CLOSED"
+        connections.loc[connections["tcp_flags"] == "S", "State"] = "SYN_SENT"
+        
+        active_conns = connections[connections["State"] != "CLOSED"][["src_ip", "dst_ip", "dst_port", "State"]]
+        if not active_conns.empty:
+            st.dataframe(active_conns.head(10), use_container_width=True, hide_index=True)
+        else:
+            st.info("No active TCP connections.")
+
+st.markdown("---")
+
+# ── Charts ────────────────────────────────────────────────────────────────────
+chart_col1, chart_col2 = st.columns(2)
+
+with chart_col1:
+    st.subheader("📈 Bandwidth Over Time")
+    df_time = df.set_index("timestamp")
+    bw_df = df_time["length"].resample("1s").sum().reset_index()
+    bw_df.rename(columns={"length": "Bytes/sec"}, inplace=True)
+    
+    # 6. Bandwidth Spike Alert
+    if not bw_df.empty:
+        max_bw = bw_df["Bytes/sec"].max()
+        if max_bw > 5_000_000: # 5 MB/s threshold
+            st.error(f"⚠️ High Bandwidth Spike Detected: **{max_bw / 1024 / 1024:.2f} MB/s**")
+            
+    fig_bw = px.area(
+        bw_df, x="timestamp", y="Bytes/sec",
+        labels={"timestamp": "Time", "Bytes/sec": "Bandwidth (B/s)"},
+    )
+    fig_bw.update_traces(line=dict(color="#00C8FF", width=2), fillcolor="rgba(0,200,255,0.1)")
+    fig_bw.update_layout(template="plotly_dark", margin=dict(l=0, r=0, t=30, b=0))
+    st.plotly_chart(fig_bw, use_container_width=True)
+
+with chart_col2:
+    st.subheader("🥧 Protocol Distribution")
+    proto_counts = df["protocol"].value_counts().reset_index()
+    proto_counts.columns = ["Protocol", "Count"]
+    fig_pie = px.pie(
+        proto_counts, names="Protocol", values="Count", hole=0.45,
+        color="Protocol",
+        color_discrete_map={"TCP": "#636EFA", "UDP": "#EF553B", "ICMP": "#00CC96", "Other": "#AB63FA"},
+    )
+    fig_pie.update_layout(template="plotly_dark", margin=dict(l=0, r=0, t=30, b=0))
+    st.plotly_chart(fig_pie, use_container_width=True)
+
+st.markdown("---")
+
+# ── Network Topology Graph ────────────────────────────────────────────────────
+st.subheader("🕸️ Network Topology")
+st.caption("Visualizing connections between internal and external IPs.")
+
+# Create graph
+G = nx.from_pandas_edgelist(df.head(1000), 'src_ip', 'dst_ip', edge_attr='protocol', create_using=nx.Graph())
+
+if not G.nodes:
+    st.info("Not enough data to build topology graph.")
+else:
+    # Fix #6: cache layout in session_state; only recompute when the node set changes
+    node_fingerprint = frozenset(G.nodes())
+    if st.session_state.get("topo_fingerprint") != node_fingerprint:
+        st.session_state["topo_pos"] = nx.spring_layout(G, seed=42)
+        st.session_state["topo_fingerprint"] = node_fingerprint
+    pos = st.session_state["topo_pos"]
+    
+    edge_x = []
+    edge_y = []
+    for edge in G.edges():
+        x0, y0 = pos[edge[0]]
+        x1, y1 = pos[edge[1]]
+        edge_x.extend([x0, x1, None])
+        edge_y.extend([y0, y1, None])
+
+    edge_trace = go.Scatter(
+        x=edge_x, y=edge_y,
+        line=dict(width=0.5, color='#888'),
+        hoverinfo='none',
+        mode='lines'
+    )
+
+    node_x = []
+    node_y = []
+    node_text = []
+    node_size = []
+    
+    # Calculate degree for sizing
+    degrees = dict(G.degree())
+    
+    for node in G.nodes():
+        x, y = pos[node]
+        node_x.append(x)
+        node_y.append(y)
+        node_text.append(f"IP: {node}<br>Connections: {degrees[node]}")
+        # Scale size based on connections
+        node_size.append(10 + (degrees[node] * 2))
+
+    node_trace = go.Scatter(
+        x=node_x, y=node_y,
+        mode='markers+text',
+        text=[n if degrees[n] > 5 else "" for n in G.nodes()], # Only label busy nodes
+        textposition="bottom center",
+        hoverinfo='text',
+        hovertext=node_text,
+        marker=dict(
+            showscale=True,
+            colorscale='YlGnBu',
+            color=[degrees[n] for n in G.nodes()],
+            size=node_size,
+            colorbar=dict(title="Connections"),
+            line_width=2
+        )
+    )
+
+    fig_net = go.Figure(data=[edge_trace, node_trace],
+                 layout=go.Layout(
+                    showlegend=False,
+                    hovermode='closest',
+                    margin=dict(b=0,l=0,r=0,t=0),
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                    yaxis=dict(showgrid=False, zeroline=False, showticklabels=False))
+                 )
+    fig_net.update_layout(template="plotly_dark")
+    st.plotly_chart(fig_net, use_container_width=True)
+
+st.markdown("---")
+
+# ── Top 5 Talkers ─────────────────────────────────────────────────────────────
+st.subheader("🏆 Top 5 Talkers (Source IPs)")
+top_talkers = (
+    df.groupby("src_ip")["length"].sum()
+    .reset_index()
+    .sort_values("length", ascending=False)
+    .head(5)
+    .rename(columns={"src_ip": "Source IP", "length": "Total Bytes"})
+)
+tab_col, bar_col = st.columns(2)
+with tab_col:
+    st.dataframe(top_talkers, use_container_width=True, hide_index=True)
+with bar_col:
+    fig_bar = px.bar(top_talkers, x="Source IP", y="Total Bytes", color="Source IP", text_auto=".2s")
+    fig_bar.update_layout(template="plotly_dark", margin=dict(l=0, r=0, t=30, b=0), showlegend=False)
+    st.plotly_chart(fig_bar, use_container_width=True)
+
+st.markdown("---")
+
+# ── Live Packet Table ─────────────────────────────────────────────────────────
+st.subheader("📋 Live Packet Stream")
+st.caption("Most recent 200 packets — filtered by your Display Filter above.")
+
+display_cols = ["id", "timestamp", "src_ip", "src_port", "dst_ip", "dst_port", "protocol", "service", "length", "info"]
+available_cols = [c for c in display_cols if c in df.columns]
+
+pkt_table = (
+    df[available_cols]
+    .tail(200)
+    .sort_values("timestamp", ascending=False)
+    .rename(columns={
+        "id":        "ID",
+        "timestamp": "Time",
+        "src_ip":    "Source IP",
+        "src_port":  "Src Port",
+        "dst_ip":    "Dest IP",
+        "dst_port":  "Dst Port",
+        "protocol":  "Protocol",
+        "service":   "Service",
+        "length":    "Bytes",
+        "info":      "Info",
+    })
+)
+
+# 7. Packet Detail Inspector
+selection = st.dataframe(
+    pkt_table,
+    use_container_width=True,
+    hide_index=True,
+    height=300,
+    on_select="rerun",
+    selection_mode="single-row",
+    column_config={
+        "Time":  st.column_config.DatetimeColumn("Time", format="HH:mm:ss.SSS"),
+        "Bytes": st.column_config.NumberColumn("Bytes", format="%d B"),
+        "Info":  st.column_config.TextColumn("Info"),
+    },
+)
+
+if selection and selection.selection.rows:
+    selected_idx = selection.selection.rows[0]
+    selected_row = pkt_table.iloc[selected_idx]
+    
+    st.markdown("#### 🔎 Packet Inspector")
+    colA, colB, colC = st.columns(3)
+    colA.write(f"**ID:** {selected_row.get('ID', 'N/A')}")
+    colA.write(f"**Time:** {selected_row.get('Time')}")
+    colA.write(f"**Protocol:** {selected_row.get('Protocol')}")
+    colA.write(f"**Length:** {selected_row.get('Bytes')} Bytes")
+    
+    colB.write(f"**Source:** {selected_row.get('Source IP')}:{selected_row.get('Src Port', 0)}")
+    colB.write(f"**Dest:** {selected_row.get('Dest IP')}:{selected_row.get('Dst Port', 0)}")
+    
+    info_val = selected_row.get('Info')
+    colC.write(f"**Dissected Info:** {info_val if pd.notna(info_val) and info_val != '' else '—'}")
+    
+    # Show tcp_flags if available
+    orig_row = df[df["id"] == selected_row.get("ID")]
+    if not orig_row.empty and "tcp_flags" in orig_row.columns:
+        flags = orig_row.iloc[0]["tcp_flags"]
+        if pd.notna(flags) and flags:
+            colC.write(f"**TCP Flags:** `{flags}`")
+
+# ── SNI Domain Table ──────────────────────────────────────────────────────────
+if "sni" in df.columns:
+    snis = df[df["sni"].notna() & (df["sni"] != "")]["sni"].value_counts().reset_index()
+    snis.columns = ["Domain (SNI)", "Connections"]
+    if not snis.empty:
+        st.markdown("---")
+        st.subheader("🔐 Top HTTPS Domains (SNI)")
+        st.dataframe(snis.head(15), use_container_width=True, hide_index=True)
+
+# ── Auto-refresh ──────────────────────────────────────────────────────────────
+if auto_refresh:
+    time.sleep(refresh_rate)
+    st.rerun()

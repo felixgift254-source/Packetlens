@@ -1,0 +1,16 @@
+{
+  "venvPath": ".",
+  "venv": "venv",
+  "pythonVersion": "3.12",
+  "pythonPlatform": "Linux",
+  "extraPaths": [
+    "venv/lib/python3.12/site-packages"
+  ],
+  "include": ["."],
+  "exclude": ["venv", ".backup", "__pycache__"],
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none",
+  "reportAttributeAccessIssue": "none",
+  "reportMissingTypeStubs": "none"
+}
+
